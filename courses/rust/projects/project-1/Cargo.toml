@@ -6,7 +6,7 @@ description = "A key-value store"
 edition = "2021"
 
 [dependencies]
-clap = "3.2.8"
+clap = { version = "3.2.8", features = ["derive"] }
 
 [dev-dependencies]
 assert_cmd = "2.0.4"
