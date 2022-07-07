@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
 use crate::{KvsError, Result};
-use std::ffi::OsStr;
 
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
+
+// TODO: `serde_json::from_reader` is one order of magnitude slower than
+// `from_str` / `from_slice`. Consider change it to `from_slice` + mmap.
 
 /// The `KvStore` stores string key/value pairs.
 ///
@@ -32,10 +34,11 @@ const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 pub struct KvStore {
     // directory for the log and other data.
     path: PathBuf,
+    // TODO: we only need buffer in `load` and `compact`
     // map generation number to the file reader.
-    readers: HashMap<u64, BufReaderWithPos<File>>,
+    readers: HashMap<u64, ReaderWithPos<BufReader<File>>>,
     // writer of the current log.
-    writer: BufWriterWithPos<File>,
+    writer: WriterWithPos<File>,
     current_gen: u64,
     index: BTreeMap<String, CommandPos>,
     // the number of bytes representing "stale" commands that could be
@@ -62,7 +65,7 @@ impl KvStore {
         let mut uncompacted = 0;
 
         for &gen in &gen_list {
-            let mut reader = BufReaderWithPos::new(File::open(log_path(&path, gen))?)?;
+            let mut reader = ReaderWithPos::new(BufReader::new(File::open(log_path(&path, gen))?))?;
             uncompacted += load(gen, &mut reader, &mut index)?;
             readers.insert(gen, reader);
         }
@@ -156,15 +159,15 @@ impl KvStore {
 
     /// Clears stale entries in the log.
     pub fn compact(&mut self) -> Result<()> {
-        // increase current gen by 2. current_gen + 1 is for the compaction file.
         let compaction_gen = self.current_gen + 1;
+        let temp = self.new_log_file(compaction_gen)?;
+        let mut compaction_writer = BufWriter::new(temp.inner);
+        let mut compaction_pos = temp.pos;
+
         self.current_gen += 2;
         self.writer = self.new_log_file(self.current_gen)?;
 
-        let mut compaction_writer = self.new_log_file(compaction_gen)?;
-
-        let mut new_pos = 0; // pos in the new log file.
-        for cmd_pos in &mut self.index.values_mut() {
+        for cmd_pos in self.index.values_mut() {
             let reader = self
                 .readers
                 .get_mut(&cmd_pos.gen)
@@ -175,11 +178,16 @@ impl KvStore {
 
             let mut entry_reader = reader.take(cmd_pos.len);
             let len = io::copy(&mut entry_reader, &mut compaction_writer)?;
-            *cmd_pos = (compaction_gen, new_pos..new_pos + len).into();
-            new_pos += len;
+            *cmd_pos = CommandPos {
+                gen: compaction_gen,
+                pos: compaction_pos,
+                len,
+            };
+            compaction_pos += len;
         }
         compaction_writer.flush()?;
 
+        // TODO: this can be simplified by `drain_filter`, which is currently unstable
         // remove stale log files.
         let stale_gens: Vec<_> = self
             .readers
@@ -199,7 +207,7 @@ impl KvStore {
     /// Create a new log file with given generation number and add the reader to the readers map.
     ///
     /// Returns the writer to the log.
-    fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
+    fn new_log_file(&mut self, gen: u64) -> Result<WriterWithPos<File>> {
         new_log_file(&self.path, gen, &mut self.readers)
     }
 }
@@ -210,32 +218,28 @@ impl KvStore {
 fn new_log_file(
     path: &Path,
     gen: u64,
-    readers: &mut HashMap<u64, BufReaderWithPos<File>>,
-) -> Result<BufWriterWithPos<File>> {
-    let path = log_path(&path, gen);
-    let writer = BufWriterWithPos::new(
+    readers: &mut HashMap<u64, ReaderWithPos<BufReader<File>>>,
+) -> Result<WriterWithPos<File>> {
+    let path = log_path(path, gen);
+    let writer = WriterWithPos::new(
         OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open(&path)?,
     )?;
-    readers.insert(gen, BufReaderWithPos::new(File::open(&path)?)?);
+    readers.insert(gen, ReaderWithPos::new(BufReader::new(File::open(&path)?))?);
     Ok(writer)
 }
 
 /// Returns sorted generation numbers in the given directory.
 fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
-    let mut gen_list: Vec<u64> = fs::read_dir(&path)?
-        .flat_map(|res| -> Result<_> { Ok(res?.path()) })
-        .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
-        .flat_map(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .map(|s| s.trim_end_matches(".log"))
-                .map(str::parse::<u64>)
-        })
+    let mut gen_list: Vec<u64> = path
+        .read_dir()?
         .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
+        .flat_map(|path| path.file_stem()?.to_str()?.parse().ok())
         .collect();
     gen_list.sort_unstable();
     Ok(gen_list)
@@ -246,7 +250,7 @@ fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
 /// Returns how many bytes can be saved after a compaction.
 fn load(
     gen: u64,
-    reader: &mut BufReaderWithPos<File>,
+    reader: &mut ReaderWithPos<BufReader<File>>,
     index: &mut BTreeMap<String, CommandPos>,
 ) -> Result<u64> {
     // To make sure we read from the beginning of the file.
@@ -313,66 +317,60 @@ impl From<(u64, Range<u64>)> for CommandPos {
     }
 }
 
-struct BufReaderWithPos<R: Read + Seek> {
-    reader: BufReader<R>,
+struct ReaderWithPos<R: Read + Seek> {
+    inner: R,
     pos: u64,
 }
 
-impl<R: Read + Seek> BufReaderWithPos<R> {
+impl<R: Read + Seek> ReaderWithPos<R> {
     fn new(mut inner: R) -> Result<Self> {
         let pos = inner.seek(SeekFrom::Current(0))?;
-        Ok(BufReaderWithPos {
-            reader: BufReader::new(inner),
-            pos,
-        })
+        Ok(Self { inner, pos })
     }
 }
 
-impl<R: Read + Seek> Read for BufReaderWithPos<R> {
+impl<R: Read + Seek> Read for ReaderWithPos<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = self.reader.read(buf)?;
+        let len = self.inner.read(buf)?;
         self.pos += len as u64;
         Ok(len)
     }
 }
 
-impl<R: Read + Seek> Seek for BufReaderWithPos<R> {
+impl<R: Read + Seek> Seek for ReaderWithPos<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.pos = self.reader.seek(pos)?;
+        self.pos = self.inner.seek(pos)?;
         Ok(self.pos)
     }
 }
 
-struct BufWriterWithPos<W: Write + Seek> {
-    writer: BufWriter<W>,
+struct WriterWithPos<W: Write + Seek> {
+    inner: W,
     pos: u64,
 }
 
-impl<W: Write + Seek> BufWriterWithPos<W> {
+impl<W: Write + Seek> WriterWithPos<W> {
     fn new(mut inner: W) -> Result<Self> {
         let pos = inner.seek(SeekFrom::Current(0))?;
-        Ok(BufWriterWithPos {
-            writer: BufWriter::new(inner),
-            pos,
-        })
+        Ok(Self { inner, pos })
     }
 }
 
-impl<W: Write + Seek> Write for BufWriterWithPos<W> {
+impl<W: Write + Seek> Write for WriterWithPos<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let len = self.writer.write(buf)?;
+        let len = self.inner.write(buf)?;
         self.pos += len as u64;
         Ok(len)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.inner.flush()
     }
 }
 
-impl<W: Write + Seek> Seek for BufWriterWithPos<W> {
+impl<W: Write + Seek> Seek for WriterWithPos<W> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.pos = self.writer.seek(pos)?;
+        self.pos = self.inner.seek(pos)?;
         Ok(self.pos)
     }
 }

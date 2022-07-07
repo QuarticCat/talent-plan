@@ -6,11 +6,11 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum KvsError {
     /// IO error.
-    #[error("{0}")]
+    #[error(transparent)]
     Io(#[from] io::Error),
 
     /// Serialization or deserialization error.
-    #[error("{0}")]
+    #[error(transparent)]
     Serde(#[from] serde_json::Error),
 
     /// Removing non-existent key error.
